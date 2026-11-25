@@ -1,0 +1,10 @@
+render:
+  - type: web
+    name: clips-ai-import
+    runtime: docker
+    plan: free
+    envVars:
+      - key: CORS_ORIGINS
+        value: "*"
+      - key: MAX_IMPORT_BYTES
+        value: "786432000"
