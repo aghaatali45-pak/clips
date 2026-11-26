@@ -6,6 +6,7 @@ import os
 import re
 import shutil
 import struct
+import sys
 import tempfile
 import uuid
 import wave
@@ -31,20 +32,48 @@ TEMP_DIR.mkdir(parents=True, exist_ok=True)
 MAX_BYTES = int(os.getenv("MAX_IMPORT_BYTES", str(750 * 1024 * 1024)))
 EXCITING_WORDS = {"amazing", "wow", "unbelievable", "funny", "crazy", "insane", "best", "hilarious", "omg"}
 
+# --- FIX FOR VERCEL: use python -m yt_dlp + bundled ffmpeg ---
+def yt_dlp_cmd():
+    return [sys.executable, "-m", "yt_dlp"]
+
+def ffmpeg_exe():
+    try:
+        import imageio_ffmpeg
+        return imageio_ffmpeg.get_ffmpeg_exe()
+    except Exception:
+        return shutil.which("ffmpeg")
+
+def ffprobe_exe():
+    return shutil.which("ffprobe")
+
+async def get_duration(video: Path) -> float:
+    # Try ffprobe first, fallback to ffmpeg -i parsing
+    probe = ffprobe_exe()
+    if probe:
+        code, out, _ = await run_process(probe, "-v", "error", "-show_entries", "format=duration", "-of", "default=noprint_wrappers=1:nokey=1", str(video), timeout=20)
+        if code == 0:
+            try:
+                return float(out.decode().strip())
+            except Exception:
+                pass
+    ff = ffmpeg_exe()
+    if ff:
+        code, _, err = await run_process(ff, "-i", str(video), timeout=20)
+        m = re.search(r"Duration: (\d+):(\d+):([\d.]+)", err.decode("utf-8", "replace"))
+        if m:
+            return int(m.group(1))*3600 + int(m.group(2))*60 + float(m.group(3))
+    return 0.0
 
 class ImportRequest(BaseModel):
     url: HttpUrl
-
 
 class ClipRequest(BaseModel):
     start: float
     end: float
 
-
 def supported_url(url: str) -> bool:
     host = (urlparse(url).hostname or "").lower().rstrip(".")
     return host == "youtu.be" or host == "youtube.com" or host.endswith(".youtube.com") or host == "tiktok.com" or host.endswith(".tiktok.com")
-
 
 def youtube_id(url: str) -> str | None:
     parsed = urlparse(url)
@@ -59,29 +88,25 @@ def youtube_id(url: str) -> str | None:
             return pieces[1]
     return None
 
-
 async def run_process(*args: str, timeout: int) -> tuple[int, bytes, bytes]:
     process = await asyncio.create_subprocess_exec(*args, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
     stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=timeout)
     return process.returncode or 0, stdout, stderr
 
-
 @app.get("/health")
 def health():
     return {"ok": True}
-
 
 @app.post("/api/import")
 async def import_media(payload: ImportRequest):
     url = str(payload.url)
     if not supported_url(url):
         raise HTTPException(status_code=400, detail="Only public YouTube and TikTok URLs are supported.")
-    if shutil.which("yt-dlp") is None:
-        raise HTTPException(status_code=500, detail="yt-dlp is not installed on the server.")
     job_id = uuid.uuid4().hex
     workdir = TEMP_DIR / job_id
     workdir.mkdir(parents=True, exist_ok=True)
-    command = ["yt-dlp", "--no-playlist", "--no-warnings", "--max-filesize", str(MAX_BYTES), "--format", "bv*[height<=1080]+ba/b[height<=1080]/b", "--merge-output-format", "mp4", "--output", str(workdir / "video.%(ext)s"), "--", url]
+    # Single-file MP4, no ffmpeg merge needed
+    command = yt_dlp_cmd() + ["--no-playlist", "--no-warnings", "--max-filesize", str(MAX_BYTES), "--format", "b[ext=mp4][height<=1080]/b[height<=1080]/b", "--remux-video", "mp4", "--output", str(workdir / "video.%(ext)s"), "--", url]
     try:
         code, _, stderr = await run_process(*command, timeout=240)
         if code:
@@ -91,7 +116,7 @@ async def import_media(payload: ImportRequest):
             raise HTTPException(status_code=422, detail="No downloadable media was found.")
         source, target = candidates[0], workdir / "source.mp4"
         if source.suffix.lower() != ".mp4":
-            ffmpeg = shutil.which("ffmpeg")
+            ffmpeg = ffmpeg_exe()
             if not ffmpeg:
                 raise HTTPException(status_code=500, detail="ffmpeg is not installed on the server.")
             code, _, _ = await run_process(ffmpeg, "-y", "-i", str(source), "-c:v", "libx264", "-c:a", "aac", "-movflags", "+faststart", str(target), timeout=300)
@@ -109,7 +134,6 @@ async def import_media(payload: ImportRequest):
     except asyncio.TimeoutError:
         shutil.rmtree(workdir, ignore_errors=True)
         raise HTTPException(status_code=504, detail="Import timed out. Try a shorter public video.")
-
 
 def parse_vtt(path: Path) -> list[dict]:
     if not path.exists():
@@ -134,7 +158,6 @@ def parse_vtt(path: Path) -> list[dict]:
             break
     return cues
 
-
 def audio_windows(wav_path: Path) -> list[float]:
     with wave.open(str(wav_path), "rb") as audio:
         channels, sample_width, rate, frames = audio.getnchannels(), audio.getsampwidth(), audio.getframerate(), audio.getnframes()
@@ -150,7 +173,6 @@ def audio_windows(wav_path: Path) -> list[float]:
             values.append(math.sqrt(sum(sample * sample for sample in chunk) / len(chunk)) / 32768)
     return values
 
-
 @app.post("/api/import/{job_id}/best-moments")
 async def best_moments(job_id: str):
     if not re.fullmatch(r"[a-f0-9]{32}", job_id):
@@ -159,12 +181,11 @@ async def best_moments(job_id: str):
     video = workdir / "source.mp4"
     if not video.is_file():
         raise HTTPException(status_code=404, detail="Imported video has expired or does not exist.")
-    ffmpeg, ffprobe = shutil.which("ffmpeg"), shutil.which("ffprobe")
-    if not ffmpeg or not ffprobe:
-        raise HTTPException(status_code=500, detail="ffmpeg and ffprobe are required for analysis.")
+    ffmpeg = ffmpeg_exe()
+    if not ffmpeg:
+        raise HTTPException(status_code=500, detail="ffmpeg is required for analysis.")
     try:
-        code, probe_out, _ = await run_process(ffprobe, "-v", "error", "-show_entries", "format=duration", "-of", "default=noprint_wrappers=1:nokey=1", str(video), timeout=20)
-        duration = float(probe_out.decode().strip()) if code == 0 else 0
+        duration = await get_duration(video)
         if duration < 15:
             raise HTTPException(status_code=422, detail="Video must be at least 15 seconds long to find moments.")
         wav_path = workdir / "analysis.wav"
@@ -177,7 +198,7 @@ async def best_moments(job_id: str):
         if source_url_file.exists():
             source_url = source_url_file.read_text(encoding="utf-8")
             if youtube_id(source_url):
-                await run_process("yt-dlp", "--skip-download", "--no-warnings", "--write-subs", "--write-auto-subs", "--sub-langs", "en.*,en", "--sub-format", "vtt/best", "--output", str(workdir / "captions.%(ext)s"), "--", source_url, timeout=90)
+                await run_process(*yt_dlp_cmd(), "--skip-download", "--no-warnings", "--write-subs", "--write-auto-subs", "--sub-langs", "en.*,en", "--sub-format", "vtt/best", "--output", str(workdir / "captions.%(ext)s"), "--", source_url, timeout=90)
                 vtt_files = list(workdir.glob("captions*.vtt"))
                 if vtt_files:
                     transcript = parse_vtt(vtt_files[0])
@@ -234,7 +255,6 @@ async def best_moments(job_id: str):
     except (OSError, ValueError, wave.Error, struct.error) as error:
         raise HTTPException(status_code=422, detail=f"Could not analyze media: {error}")
 
-
 @app.post("/api/import/{job_id}/clip")
 async def create_clip(job_id: str, payload: ClipRequest):
     if not re.fullmatch(r"[a-f0-9]{32}", job_id):
@@ -246,11 +266,11 @@ async def create_clip(job_id: str, payload: ClipRequest):
     if payload.start < 0 or payload.end <= payload.start or not 15 <= payload.end - payload.start <= 30:
         raise HTTPException(status_code=422, detail="Clip duration must be between 15 and 30 seconds.")
     output = workdir / f"clip-{uuid.uuid4().hex}.mp4"
-    code, _, _ = await run_process("ffmpeg", "-y", "-ss", str(payload.start), "-i", str(video), "-t", str(payload.end - payload.start), "-c:v", "libx264", "-c:a", "aac", "-movflags", "+faststart", str(output), timeout=180)
+    ffmpeg = ffmpeg_exe()
+    code, _, _ = await run_process(ffmpeg, "-y", "-ss", str(payload.start), "-i", str(video), "-t", str(payload.end - payload.start), "-c:v", "libx264", "-c:a", "aac", "-movflags", "+faststart", str(output), timeout=180)
     if code or not output.is_file():
         raise HTTPException(status_code=422, detail="Could not cut the requested clip.")
     return {"download_url": f"/api/import/{job_id}/clips/{output.name}", "filename": output.name}
-
 
 @app.get("/api/import/{job_id}/clips/{filename}")
 def download_clip(job_id: str, filename: str):
@@ -261,7 +281,6 @@ def download_clip(job_id: str, filename: str):
         raise HTTPException(status_code=404, detail="Clip not found or expired.")
     return FileResponse(target, media_type="video/mp4", filename=filename)
 
-
 @app.get("/api/media/{job_id}")
 def media(job_id: str):
     if not re.fullmatch(r"[a-f0-9]{32}", job_id):
@@ -270,7 +289,6 @@ def media(job_id: str):
     if not target.is_file():
         raise HTTPException(status_code=404, detail="Media has expired or does not exist.")
     return FileResponse(target, media_type="video/mp4", filename="source.mp4")
-
 
 @app.delete("/api/media/{job_id}")
 def cleanup(job_id: str):
